@@ -1,0 +1,373 @@
+Abaixo está o plano detalhado e concreto do programa em shell script para criar e manter atualizada uma Linux From Scratch completa e depois uma Beyond Linux From Scratch, com todo o processo executado dentro de um chroot seguro (montagens e desmontagens seguras) e com módulos carregando seus próprios arquivos de configuração.
+
+1 — Visão geral do projeto
+
+Objetivo: um conjunto de scripts/modularizado em shell que automatiza a construção reprodutível de um sistema LFS e BLFS, realiza atualizações incrementais, e executa todo o processo dentro de um chroot isolado e seguro. Cada funcionalidade é um módulo (script) com seu próprio arquivo de configuração carregado apenas por ele.
+
+Principais princípios:
+
+Modularidade: cada passo (download, verificação, build de pacote, instalação, limpeza) é um módulo.
+
+Idempotência: rodar o mesmo módulo duas vezes deve deixar o sistema no mesmo estado (quando apropriado).
+
+Segurança: execução em chroot com namespaces (quando disponível), montagem com flags seguras, execução com menos privilégios possível, trap para desmontar em falhas.
+
+Verificabilidade: logs, hashes, assinaturas GPG, artefatos armazenados.
+
+Configuração por módulo: cada módulo tem /etc/lfs-builder/modules/<nome>.conf (ou similar) e carrega somente seu próprio arquivo.
+
+Reprodutibilidade: registros de versões, ambiente de build (CFLAGS, PATH, cross-compiling flags, etc).
+
+Atualizações: mecanismo para atualizar fontes e reconstruir pacotes afetados (dependency graph).
+
+
+2 — Estrutura dos arquivos (layout do projeto)
+
+Exemplo de estrutura de diretórios que vou implementar:
+
+/usr/local/bin/lfs-builder/         # scripts principais (entrypoint + módulos)
+├─ lfs-builder.sh                   # CLI / orquestrador (invoca módulos)
+├─ modules/
+│  ├─ 00-prepare-env.sh
+│  ├─ 10-downloader.sh
+│  ├─ 11-verifier.sh
+│  ├─ 20-build-package.sh
+│  ├─ 30-install-package.sh
+│  ├─ 40-post-install.sh
+│  ├─ 50-cleanup.sh
+│  ├─ chroot-manager.sh
+│  ├─ update-manager.sh
+│  └─ pkg-db.sh
+├─ conf/
+│  ├─ global.conf
+│  └─ modules/
+│     ├─ downloader.conf
+│     ├─ build-package.conf
+│     └─ chroot-manager.conf
+├─ recipes/                          # definições de pacotes LFS/BLFS (metadados)
+│  ├─ glibc.recipe
+│  ├─ linux-sources.recipe
+│  └─ ... 
+├─ build/                            # diretório de trabalho (sources, logs, artefatos)
+│  ├─ sources/
+│  ├─ logs/
+│  └─ cache/
+└─ etc/                              # runtime / chroot mounts, snapshots
+
+> Observação: nomes e caminhos são sugestivos; posso torná-los configuráveis.
+
+
+
+3 — Principais módulos (descrição e responsabilidades)
+
+Vou implementar os seguintes módulos (cada um é um script independente que carrega seu próprio config):
+
+1. 00-prepare-env
+
+Cria diretórios necessários (build/, sources/, logs/, chroot/).
+
+Checa pré-requisitos no host (bash, coreutils, make, gcc, tar, gpg, patch, rsync, unshare, mount).
+
+Cria usuário dedicado de build (ex.: lfsbuilder) ou descreve como usar namespaces para evitar privilégios root.
+
+Gera um manifest inicial (versão LFS/BLFS).
+
+
+Config: conf/modules/prepare-env.conf — paths, usuário, permissões.
+
+
+2. chroot-manager
+
+Cria o diretório chroot (ex: build/chroot/), monta proc, sys, dev, dev/pts de forma segura.
+
+Usa mount --bind e mount -t tmpfs onde apropriado; aplica nosuid,nodev,noexec nas montagens quando possível.
+
+Suporta isolamento via unshare (mount, pid, net, user namespaces) se disponível.
+
+Implementa safe unmounting e trap para garantir desmontagem em falhas (umidade de ordem correta: /dev/pts, /dev, /proc, /sys, bind mounts).
+
+Opcional: suporte a pivot_root e chroot seguro; documentação sobre quando usar sudo ou rodar como root.
+
+
+Config: conf/modules/chroot-manager.conf — path do chroot, flags de montagem, namespaces (on/off), listas de bind-mounts.
+
+
+3. 10-downloader
+
+Baixa fontes listadas em recipes/*.recipe.
+
+Suporta múltiplos mirrors, retries, verificação de tamanhos.
+
+Armazena cópias em build/sources/.
+
+GPG verification workflow: baixa .sig/.asc e verifica com chaves configuradas.
+
+
+Config: conf/modules/downloader.conf — mirrors, timeouts, gpg-keys-path.
+
+
+4. 11-verifier
+
+Verifica checksums (SHA256/512) e assinaturas GPG dos tarballs.
+
+Mantém um banco local de hashes e resultados; falha limpa em discrepância.
+
+Gera relatório (pass/fail) por pacote.
+
+
+Config: conf/modules/verifier.conf — policies (fail/ignore), keyring location.
+
+
+5. 20-build-package
+
+Recebe um recipe (metadados: nome, versão, fonte, patches, dependências, configure flags, build steps, install steps).
+
+Executa passos configure/make/make install dentro do chroot (ou no ambiente de cross-compile se necessário).
+
+Redireciona logs para build/logs/<pkg>-<ver>.log.
+
+Marca sucesso/falha no pkg-db.
+
+
+Config: conf/modules/build-package.conf — paralelismo (-j), CFLAGS default, prefix, strip flags.
+
+
+6. 30-install-package
+
+Instala arquivos no chroot de forma transacional: instala em staging e move/rsync para destino.
+
+Gera manifest (/var/lfs/pkg-manifests/<pkg>.manifest) com lista de arquivos e checksums.
+
+
+Config: conf/modules/install-package.conf — staging dir, ownership defaults.
+
+
+7. 40-post-install
+
+Configurações pós-instalação: fstab, network config, users skeleton, kernel setup (opcional), initramfs, bootloader steps (opcionais e documentados).
+
+Executa testes básicos (ldd, versão do binutils, execução de binários críticos).
+
+
+Config: conf/modules/post-install.conf — list of post tasks, test toggles.
+
+
+8. 50-cleanup
+
+Remove arquivos temporários, desmonta e limpa chroot, opcionalmente cria snapshots/archives dos artefatos.
+
+Garante que nenhum descriptor de arquivo esteja mantendo montagem.
+
+
+Config: conf/modules/cleanup.conf — keep cache? compress logs?
+
+
+9. pkg-db
+
+Banco simples (JSON/TXT) com metadados dos pacotes instalados, hash do build, tempo, logs, dependências.
+
+Usado por update-manager para decidir rebuilds.
+
+
+Config: conf/modules/pkg-db.conf — path do banco, formato (json/yaml).
+
+
+10. update-manager
+
+Roda checagens periódicas (ou manual): compara versões nas sources/mirrors com o pkg-db.
+
+Planeja rebuilds (reconstrói dependências quando necessário).
+
+Pode gerar um plan (lista ordenada de pacotes a rebuildar).
+
+Suporta hooks (pré-update, pós-update).
+
+
+Config: conf/modules/update-manager.conf — update intervals, policies (auto/manual), notification hooks.
+
+
+11. orquestrador / CLI (lfs-builder.sh)
+
+Entrada única para invocar modos: build all, build pkg, update check, enter-chroot, clean.
+
+Carrega global.conf e invoca módulos na ordem correta.
+
+Mostra preview de ações (dry-run) antes de executar — IMPORTANTE: você pediu sempre mostrar o que será implementado antes de gerar código; o script também terá um --dry-run que mostra exatamente o que fará.
+
+
+Config: conf/global.conf — root path, default chroot name, logging level.
+
+
+
+4 — Formato de configuração por módulo (exemplo)
+
+Cada módulo tem seu arquivo conf/modules/<modulo>.conf. Formato proposto: INI ou YAML (vou sugerir YAML por clareza; posso mudar para INI se preferir).
+
+Exemplo esquemático (sem código, só campos):
+
+conf/modules/build-package.conf (exemplo de campos)
+
+parallel_jobs: integer
+
+cflags: string
+
+ldflags: string
+
+install_prefix: string
+
+staging_dir: path
+
+strip_binaries: boolean
+
+keep_build_dir: boolean
+
+
+Cada módulo lê somente seu arquivo (por exemplo, source conf/modules/build-package.conf) e exporta suas variáveis ou usa utilitários de parsing mínimos.
+
+5 — Fluxo seguro de montagem / chrooting (passo-a-passo)
+
+Vou documentar e implementar este fluxo no chroot-manager:
+
+1. Preparação
+
+checar se já existem mounts ativos (evitar duplo mount).
+
+criar chroot base (diretórios dev, proc, sys, run, tmp, var/tmp etc).
+
+
+
+2. Isolamento de namespace (se suportado)
+
+usar unshare --map-root-user --mount --pid --fork para separar. (O script detecta suporte e escolhe a melhor estratégia).
+
+criar usuário não-root dentro do namespace se possível.
+
+
+
+3. Bind mounts e mounts seguros
+
+mount --bind /dev ${CHROOT}/dev e depois mount --make-rslave ${CHROOT}/dev (ou rprivate dependendo do cenário).
+
+montar dev/pts, proc com nosuid,nodev,noexec onde aplicável.
+
+montar tmpfs para /tmp dentro do chroot (opcional), com mode=1777.
+
+aplicar nodev, nosuid, noexec em pontos que não precisam executar binários.
+
+
+
+4. Entrar no chroot
+
+usar chroot combinado com exec su -s /bin/bash -c para executar o processo de build com o usuário dedicado.
+
+em ambientes com unshare, o processo já estará em namespace separado.
+
+
+
+5. Desmontagem segura
+
+trap EXIT e ERR para executar rotina de desmontagem.
+
+desmontar na ordem inversa (pts → dev/pts → dev → proc → sys → bind mounts).
+
+se umount falhar, tentar fuser -km (opcional, documentado) e re-tentar; logar o erro e abortar com estado claro.
+
+garantir que não existam processos presos dentro do chroot antes de desmontar (checar /proc/*/root ou lsof +D).
+
+
+
+
+6 — Verificação de fontes e segurança de build
+
+Hashes e assinaturas: cada recipe tem sha256 e gpg-sig metadata; downloader e verifier aplicam checagem.
+
+Chave GPG: repositório local de chaves conf/keys/ e instruções para importar chaves oficiais.
+
+Rebuild determinístico: registrar CFLAGS, versão do toolchain e ambiente; armazenar manifest para poder reproduzir o build.
+
+Limitar privilégios: executar builds como usuário não-root dentro do chroot, usar user namespaces para mapear root->unprivileged user.
+
+Sandboxing extra (opcional): instruções para usar containers (chroot dentro de container), QEMU for cross, ou usar bwrap/bubblewrap quando disponível.
+
+
+7 — Estratégia de updates / manutenção
+
+Source watch: update-manager consulta manifests upstream (ou recebe input manual) e detecta mudanças de versão.
+
+Dependency graph: recipes listam dependências; o pkg-db calcula ordem topológica para rebuilds.
+
+Política de atualização: safe (reconstrói apenas pacotes necessários), full (rebuild all), security-only (aplica patches críticos).
+
+Hooks: módulos podem expor hooks para ações pré/pós update (ex.: notificação, backup).
+
+Snapshots & rollback: antes de mudanças destrutivas, criar snapshot (rsync incremental, ou btrfs snapshot se disponível). Em caso de falha, permitir rollback.
+
+
+8 — Logs, artefatos e relatórios
+
+Logs por pacote: build/logs/<pkg>-<ver>.log (stdout/stderr).
+
+Relatório de build (JSON) com: nome, versão, commit, checksum fonte, tempo de build, resultado, caminho do log.
+
+Dashboard simples por linha de comando: lfs-builder status mostra pacotes instalados/versões/último build. (Implementado como saída textual; poderemos adicionar UI depois).
+
+
+9 — Testes e validação
+
+Test-suite básico: scripts que verificam execução mínima de binários (ex.: ldd /bin/bash, gcc --version, ls /bin).
+
+Smoke tests: executar scripts dentro do chroot que testam serviços essenciais (se aplicável).
+
+CI: instruções para rodar cada módulo em um runner (GitHub Actions / GitLab CI) para validar mudanças.
+
+Testes de montagem/desmontagem: testes que forçam falhas e verificam que o trap desmonta corretamente.
+
+
+10 — Mecanismo de extensibilidade e recipes
+
+Recipes: cada pacote tem um arquivo recipes/<pkg>.recipe com campos: name, version, urls, sha256, gpg, patches[], deps[], build-steps (opcionais).
+
+Hooks de recipe: pre_build, post_build, pre_install, post_install.
+
+Adicionar BLFS: BLFS será tratado como um conjunto adicional de recipes; update-manager entende ambas as camadas.
+
+
+11 — Segurança operacional e recomendações
+
+Rodar o orquestrador preferencialmente numa VM/container isolado para máxima segurança.
+
+Recomendar uso de user namespaces e unshare para evitar necessidade de permissão root prolongada.
+
+Documentar riscos: chroot não é isolamento total (namespaces + seccomp + capabilities suplementam segurança).
+
+Manter chaves GPG em local seguro; revogar automaticamente pacotes com assinatura inválida.
+
+
+12 — Mecanismo de erro e rollback
+
+Em cada step: verificar retorno (exit code) e, em falhas, executar rotina de limpeza parcial e criar um incident report.
+
+rollback para último snapshot criado automaticamente antes do conjunto crítico de mudanças (configurável).
+
+
+13 — CLI/UX proposta (comandos e flags)
+
+Comandos principais que vou implementar na CLI:
+
+lfs-builder init — prepara ambiente e configs.
+
+lfs-builder chroot enter — entra no chroot em modo interativo (debug).
+
+lfs-builder build all — constrói tudo (LFS) (exibe dry-run primeiro).
+
+lfs-builder build <pkg> — constrói pacote específico.
+
+lfs-builder update check — checa novas versões.
+
+lfs-builder update apply — aplica updates (com plano e confirmação).
+
+lfs-builder status — mostra estado do pkg-db.
+
+lfs-builder clean — limpa artefatos.
+
+Flags: --dry-run, --force, --no-cache, --jobs N, --verbose.
