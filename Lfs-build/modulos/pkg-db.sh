@@ -1,104 +1,103 @@
 #!/usr/bin/env bash
-# pkg-db.sh - Módulo de gerenciamento do DB para LFS builder
-# Versão: 1.0
-# Requisitos: bash, sqlite3, flock, awk, date, uuidgen (ou openssl), tput, df, free
-# Uso: source this file or execute functions exported by it in your orchestration script.
-#
-# WARNING: Este é um módulo destinado a ser usado por outros scripts (orquestrador).
-# Exemplo de uso (no orquestrador):
-#   source modules/pkg-db.sh
-#   pkgdb_load_config "/path/to/pkg-db.conf"
-#   pkgdb_init_db
-#   runid=$(pkgdb_init_run)
-#   pkgid=$(pkgdb_register_package "glibc" "2.35" "sha256sum" "/recipes/glibc.recipe")
-#   jid=$(pkgdb_start_job "$runid" "$pkgid" "worker-1" "/var/log/..")
-#
+# pkg-db.sh - Módulo pkg-db para LFS Builder
+# Versão: 1.1
+# Objetivo: gerenciar SQLite DB, logs, métricas e UI para builds LFS/BLFS.
+# Requisitos: bash, sqlite3, flock, awk, df, cut, date, tput, uuidgen (ou openssl/od), gzip
+# Uso típico (orquestrador): source modules/pkg-db.sh; pkgdb_load_config /path/to/pkg-db.conf; pkgdb_init_env; ...
 set -euo pipefail
 
-########## Defaults (overridable via pkg-db.conf) ##########
-PKGDB_CONF="${PKGDB_CONF:-./conf/modules/pkg-db.conf}"
-PKGDB_PATH_DEFAULT="/var/lfs/pkg-db.sqlite"
-PKGDB_LOCKFILE_DEFAULT="/var/lock/lfs-pkg-db.lock"
-PKGDB_LOG_DIR_DEFAULT="./build/logs"
-PKGDB_BACKUP_DIR_DEFAULT="./build/db-backups"
-PKGDB_WAL_DEFAULT="yes"
-PKGDB_BUSY_TIMEOUT_DEFAULT=10000       # ms
-PKGDB_RETRY_ATTEMPTS_DEFAULT=5
-PKGDB_RETRY_BACKOFF_MS_DEFAULT=200     # initial backoff ms
-PKGDB_MAX_BACKUPS_DEFAULT=10
-PKGDB_SAMPLE_INTERVAL_DEFAULT=1        # seconds
-PKGDB_ENABLE_RESOURCE_MONITOR_DEFAULT="yes"
-PKGDB_PRAGMA_SETTINGS_DEFAULT="PRAGMA synchronous=NORMAL;"
-QUIET_DEFAULT="no"
+########################################################################
+# NOTE (importante):
+# - Este arquivo é um módulo pensado para ser SOURCED por um orquestrador.
+# - Ele é idempotente: pkgdb_init_env() cria diretórios, arquivos e DB se necessário.
+# - Ajuste PKGDB_CONF antes de source se quiser usar um caminho alternativo.
+########################################################################
 
-# Internal state
-PKGDB_PATH="${PKGDB_PATH:-$PKGDB_PATH_DEFAULT}"
-PKGDB_LOCKFILE="${PKGDB_LOCKFILE:-$PKGDB_LOCKFILE_DEFAULT}"
-PKGDB_LOG_DIR="${PKGDB_LOG_DIR:-$PKGDB_LOG_DIR_DEFAULT}"
-PKGDB_BACKUP_DIR="${PKGDB_BACKUP_DIR:-$PKGDB_BACKUP_DIR_DEFAULT}"
-PKGDB_WAL="${PKGDB_WAL:-$PKGDB_WAL_DEFAULT}"
-PKGDB_BUSY_TIMEOUT="${PKGDB_BUSY_TIMEOUT:-$PKGDB_BUSY_TIMEOUT_DEFAULT}"
-PKGDB_RETRY_ATTEMPTS="${PKGDB_RETRY_ATTEMPTS:-$PKGDB_RETRY_ATTEMPTS_DEFAULT}"
-PKGDB_RETRY_BACKOFF_MS="${PKGDB_RETRY_BACKOFF_MS:-$PKGDB_RETRY_BACKOFF_MS_DEFAULT}"
-PKGDB_MAX_BACKUPS="${PKGDB_MAX_BACKUPS:-$PKGDB_MAX_BACKUPS_DEFAULT}"
-PKGDB_SAMPLE_INTERVAL="${PKGDB_SAMPLE_INTERVAL:-$PKGDB_SAMPLE_INTERVAL_DEFAULT}"
-PKGDB_ENABLE_RESOURCE_MONITOR="${PKGDB_ENABLE_RESOURCE_MONITOR:-$PKGDB_ENABLE_RESOURCE_MONITOR_DEFAULT}"
-PKGDB_PRAGMA_SETTINGS="${PKGDB_PRAGMA_SETTINGS:-$PKGDB_PRAGMA_SETTINGS_DEFAULT}"
-QUIET="${QUIET:-$QUIET_DEFAULT}"
+# Caminho padrão para o arquivo de configuração (pode ser sobrescrito antes do source)
+: "${PKGDB_CONF:=./conf/modules/pkg-db.conf}"
 
-# FD for flock
-exec 200>/var/lock/lfs-pkg-db.flock 2>/dev/null || true
+########## Defaults (podem ser sobrescritos no pkg-db.conf) ##########
+: "${PKGDB_PATH:=/var/lfs/pkg-db.sqlite}"
+: "${PKGDB_LOCKFILE:=/var/lock/lfs-pkg-db.lock}"
+: "${PKGDB_LOG_DIR:=./build/logs}"
+: "${PKGDB_BACKUP_DIR:=./build/db-backups}"
+: "${PKGDB_WAL:=yes}"
+: "${PKGDB_BUSY_TIMEOUT:=10000}"          # ms
+: "${PKGDB_RETRY_ATTEMPTS:=5}"
+: "${PKGDB_RETRY_BACKOFF_MS:=200}"       # ms base
+: "${PKGDB_MAX_BACKUPS:=10}"
+: "${PKGDB_SAMPLE_INTERVAL:=1}"          # seconds
+: "${PKGDB_ENABLE_RESOURCE_MONITOR:=yes}"
+: "${PKGDB_PRAGMA_SETTINGS:=PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-8000;}"
+: "${QUIET:=no}"
+: "${PKGDB_USER:=lfs}"
+: "${PKGDB_GROUP:=lfs}"
+: "${PKGDB_ENV_CHROOT_PATH:=/mnt/lfs}"
+: "${PKGDB_VALIDATE_SCHEMA:=yes}"
+: "${PKGDB_DEBUG:=no}"
 
-# Utility: ensure directories exist
+# Internal fd for flock operations (fallback if needed)
+# we'll use dynamic open per lock call to avoid collisions
+# Utilities
+
 _mkdirp() {
     local d="$1"
-    if [ -n "$d" ] && [ ! -d "$d" ]; then
+    [ -z "$d" ] && return 0
+    if [ ! -d "$d" ]; then
         mkdir -p "$d"
     fi
 }
 
-# Load config (shell format key=value)
+# Load configuration file (shell compatible key=value)
 pkgdb_load_config() {
     local cfg="${1:-$PKGDB_CONF}"
     if [ -f "$cfg" ]; then
         # shellcheck disable=SC1090
         source "$cfg"
     fi
-    # apply defaults if missing
-    : "${PKGDB_PATH:=$PKGDB_PATH_DEFAULT}"
-    : "${PKGDB_LOCKFILE:=$PKGDB_LOCKFILE_DEFAULT}"
-    : "${PKGDB_LOG_DIR:=$PKGDB_LOG_DIR_DEFAULT}"
-    : "${PKGDB_BACKUP_DIR:=$PKGDB_BACKUP_DIR_DEFAULT}"
-    : "${PKGDB_WAL:=$PKGDB_WAL_DEFAULT}"
-    : "${PKGDB_BUSY_TIMEOUT:=$PKGDB_BUSY_TIMEOUT_DEFAULT}"
-    : "${PKGDB_RETRY_ATTEMPTS:=$PKGDB_RETRY_ATTEMPTS_DEFAULT}"
-    : "${PKGDB_RETRY_BACKOFF_MS:=$PKGDB_RETRY_BACKOFF_MS_DEFAULT}"
-    : "${PKGDB_MAX_BACKUPS:=$PKGDB_MAX_BACKUPS_DEFAULT}"
-    : "${PKGDB_SAMPLE_INTERVAL:=$PKGDB_SAMPLE_INTERVAL_DEFAULT}"
-    : "${PKGDB_ENABLE_RESOURCE_MONITOR:=$PKGDB_ENABLE_RESOURCE_MONITOR_DEFAULT}"
-    : "${PKGDB_PRAGMA_SETTINGS:=$PKGDB_PRAGMA_SETTINGS_DEFAULT}"
-    : "${QUIET:=$QUIET_DEFAULT}"
+    # ensure directories exist variables reflect config
+    : "${PKGDB_PATH:=$PKGDB_PATH}"
+    : "${PKGDB_LOCKFILE:=$PKGDB_LOCKFILE}"
+    : "${PKGDB_LOG_DIR:=$PKGDB_LOG_DIR}"
+    : "${PKGDB_BACKUP_DIR:=$PKGDB_BACKUP_DIR}"
+    : "${PKGDB_WAL:=$PKGDB_WAL}"
+    : "${PKGDB_BUSY_TIMEOUT:=$PKGDB_BUSY_TIMEOUT}"
+    : "${PKGDB_RETRY_ATTEMPTS:=$PKGDB_RETRY_ATTEMPTS}"
+    : "${PKGDB_RETRY_BACKOFF_MS:=$PKGDB_RETRY_BACKOFF_MS}"
+    : "${PKGDB_MAX_BACKUPS:=$PKGDB_MAX_BACKUPS}"
+    : "${PKGDB_SAMPLE_INTERVAL:=$PKGDB_SAMPLE_INTERVAL}"
+    : "${PKGDB_ENABLE_RESOURCE_MONITOR:=$PKGDB_ENABLE_RESOURCE_MONITOR}"
+    : "${PKGDB_PRAGMA_SETTINGS:=$PKGDB_PRAGMA_SETTINGS}"
+    : "${QUIET:=$QUIET}"
+    : "${PKGDB_USER:=$PKGDB_USER}"
+    : "${PKGDB_GROUP:=$PKGDB_GROUP}"
+    : "${PKGDB_ENV_CHROOT_PATH:=$PKGDB_ENV_CHROOT_PATH}"
+    : "${PKGDB_VALIDATE_SCHEMA:=$PKGDB_VALIDATE_SCHEMA}"
+    : "${PKGDB_DEBUG:=$PKGDB_DEBUG}"
 
+    # create base dirs if needed
     _mkdirp "$(dirname "$PKGDB_PATH")"
     _mkdirp "$PKGDB_LOG_DIR"
     _mkdirp "$PKGDB_BACKUP_DIR"
     _mkdirp "$(dirname "$PKGDB_LOCKFILE")"
 
-    # Make lockfile exist
-    : > "$PKGDB_LOCKFILE" || true
+    # ensure lockfile exists
+    : > "$PKGDB_LOCKFILE" 2>/dev/null || true
 }
 
 # Small uuid generator fallback
 _pkgdb_gen_uuid() {
     if command -v uuidgen >/dev/null 2>&1; then
         uuidgen
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 12
     else
-        # fallback: timestamp + random hex
-        printf '%s-%s\n' "$(date +%s)" "$(openssl rand -hex 8 2>/dev/null || od -vAn -N8 -tx1 /dev/urandom | tr -d ' \n')"
+        # fallback: timestamp + random from /dev/urandom
+        printf '%s-%s\n' "$(date +%s)" "$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
     fi
 }
 
-# Run sqlite with retries and flock for critical operations
+# Internal: perform sqlite operation with retries
 _sqlite_exec() {
     local sql="$1"
     local tries=0
@@ -106,50 +105,49 @@ _sqlite_exec() {
 
     while :; do
         if [ "${PKGDB_WAL,,}" = "yes" ]; then
-            # ensure WAL mode set once (best-effort)
+            # ensure WAL mode set (best-effort)
             sqlite3 "$PKGDB_PATH" "PRAGMA journal_mode=WAL;" >/dev/null 2>&1 || true
         fi
-        # set busy timeout and other pragmas per invocation
+
         if sqlite3 "$PKGDB_PATH" "PRAGMA busy_timeout=$PKGDB_BUSY_TIMEOUT; $PKGDB_PRAGMA_SETTINGS $sql"; then
             return 0
         else
             tries=$((tries + 1))
-            if [ $tries -ge "$PKGDB_RETRY_ATTEMPTS" ]; then
+            if [ "$tries" -ge "$PKGDB_RETRY_ATTEMPTS" ]; then
                 echo "pkg-db: sqlite failed after $tries attempts" >&2
                 return 1
             fi
             # exponential backoff
-            sleep_ms=$((backoff_ms * (2 ** (tries - 1))))
-            # convert ms to s for sleep
-            awk "BEGIN{printf \"%.3f\", $sleep_ms/1000}" | xargs sleep
+            local sleep_s
+            sleep_s=$(awk "BEGIN{printf \"%.3f\", ($backoff_ms * (2 ^ ($tries - 1))) / 1000}")
+            sleep "$sleep_s"
         fi
     done
 }
 
-# Acquire exclusive lock (flock) for critical sections
+# Acquire a POSIX flock on the configured lockfile for critical sections
 _pkgdb_acquire_lock() {
-    local lock="${PKGDB_LOCKFILE}"
-    # open fd 201 for lock file to avoid interfering with global 200
-    exec 201>"$lock"
-    flock -x 201 || return 1
-    return 0
+    local lockfile="$PKGDB_LOCKFILE"
+    local fd="${1:-201}"
+    # ensure file exists
+    : > "$lockfile"
+    # open fd
+    eval "exec ${fd}>\"$lockfile\""
+    flock -x "$fd"
+    # export fd number so release knows it
+    echo "$fd"
 }
 
-# Release lock acquired by _pkgdb_acquire_lock
 _pkgdb_release_lock() {
-    flock -u 201 || true
-    exec 201>&- || true
+    local fd="${1:-201}"
+    # release and close
+    flock -u "$fd" 2>/dev/null || true
+    eval "exec ${fd}>&- || true"
 }
 
 # Initialize DB schema (idempotent)
-pkgdb_init_db() {
-    _pkgdb_acquire_lock
-    trap '_pkgdb_release_lock' RETURN
-
-    if [ ! -f "$PKGDB_PATH" ]; then
-        sqlite3 "$PKGDB_PATH" "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = $PKGDB_BUSY_TIMEOUT; $PKGDB_PRAGMA_SETTINGS"
-    fi
-
+pkgdb_init_db_schema() {
+    local ddl
     read -r -d '' ddl <<'SQL' || true
 BEGIN;
 CREATE TABLE IF NOT EXISTS build_runs (
@@ -240,117 +238,181 @@ CREATE TABLE IF NOT EXISTS locks (
 COMMIT;
 SQL
 
-    _sqlite_exec "$ddl" || return 1
+    _sqlite_exec "$ddl"
+}
+
+# Initialize environment: create dirs, set permissions, create DB file and schema
+pkgdb_init_env() {
+    # Ensure config loaded
+    if [ -z "${PKGDB_PATH:-}" ]; then
+        echo "pkg-db: PKGDB_PATH not set. Call pkgdb_load_config first." >&2
+        return 1
+    fi
+
+    _mkdirp "$(dirname "$PKGDB_PATH")"
+    _mkdirp "$PKGDB_LOG_DIR"
+    _mkdirp "$PKGDB_BACKUP_DIR"
+    _mkdirp "$(dirname "$PKGDB_LOCKFILE")"
+
+    # Set owner if user/group exist
+    if id -u "$PKGDB_USER" >/dev/null 2>&1; then
+        chown -R "$PKGDB_USER":"$PKGDB_GROUP" "$(dirname "$PKGDB_PATH")" 2>/dev/null || true
+        chown -R "$PKGDB_USER":"$PKGDB_GROUP" "$PKGDB_LOG_DIR" 2>/dev/null || true
+        chown -R "$PKGDB_USER":"$PKGDB_GROUP" "$PKGDB_BACKUP_DIR" 2>/dev/null || true
+    fi
+
+    # Ensure lockfile exists
+    : > "$PKGDB_LOCKFILE" 2>/dev/null || true
+
+    # If DB does not exist, create and initialize schema
+    if [ ! -f "$PKGDB_PATH" ]; then
+        # create file and set mode
+        sqlite3 "$PKGDB_PATH" "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=$PKGDB_BUSY_TIMEOUT; $PKGDB_PRAGMA_SETTINGS;" 2>/dev/null || true
+        pkgdb_init_db_schema
+    else
+        # ensure pragmas applied
+        sqlite3 "$PKGDB_PATH" "PRAGMA busy_timeout=$PKGDB_BUSY_TIMEOUT; $PKGDB_PRAGMA_SETTINGS;" 2>/dev/null || true
+        if [ "${PKGDB_VALIDATE_SCHEMA,,}" = "yes" ]; then
+            local result
+            result=$(sqlite3 "$PKGDB_PATH" "PRAGMA integrity_check;" 2>/dev/null || echo "corrupt")
+            if [ "$result" != "ok" ]; then
+                echo "pkg-db: integrity_check failed: $result" >&2
+                echo "pkg-db: creating backup and attempting to reinitialize schema" >&2
+                pkgdb_backup || true
+                pkgdb_init_db_schema || true
+            fi
+        fi
+    fi
+
+    # Set permissions on DB file
+    if id -u "$PKGDB_USER" >/dev/null 2>&1; then
+        chown "$PKGDB_USER":"$PKGDB_GROUP" "$PKGDB_PATH" 2>/dev/null || true
+    fi
+
     return 0
 }
 
-# Backup DB
+# Backup DB file with rotation
 pkgdb_backup() {
-    _pkgdb_acquire_lock
-    trap '_pkgdb_release_lock' RETURN
-
     _mkdirp "$PKGDB_BACKUP_DIR"
-    local ts
+    local ts backup
     ts=$(date +%Y%m%dT%H%M%S)
-    local target="$PKGDB_BACKUP_DIR/pkg-db.$ts.sqlite"
-    cp -a "$PKGDB_PATH" "$target"
-    # prune old backups
-    (ls -1t "$PKGDB_BACKUP_DIR"/pkg-db.*.sqlite 2>/dev/null || true) | tail -n +"$((PKGDB_MAX_BACKUPS + 1))" | xargs -r rm -f --
-    echo "$target"
+    backup="$PKGDB_BACKUP_DIR/pkg-db.$ts.sqlite"
+    cp -a "$PKGDB_PATH" "$backup"
+    # rotate
+    local to_delete
+    to_delete=$(ls -1t "$PKGDB_BACKUP_DIR"/pkg-db.*.sqlite 2>/dev/null | tail -n +"$((PKGDB_MAX_BACKUPS + 1))" || true)
+    if [ -n "$to_delete" ]; then
+        echo "$to_delete" | xargs -r rm -f --
+    fi
+    echo "$backup"
 }
 
-# Integrity check
+# Basic integrity check wrapper
 pkgdb_integrity_check() {
     sqlite3 "$PKGDB_PATH" "PRAGMA integrity_check;"
 }
 
-# -- API Functions --
+# -------------------------
+# API functions (DB ops)
+# -------------------------
 
-# Start a run; returns run_id
+# Start a run; prints run_id
 pkgdb_init_run() {
     local run_uuid="${1:-$(_pkgdb_gen_uuid)}"
     local user="${2:-$(whoami 2>/dev/null || echo unknown)}"
     local host="${3:-$(hostname 2>/dev/null || echo unknown)}"
     local chroot_path="${4:-}"
-
-    local sql="INSERT INTO build_runs(run_uuid, started_at, user, host, chroot_path) VALUES('$run_uuid', DATETIME('now'), '$user', '$host', '${chroot_path}'); SELECT last_insert_rowid();"
-    _pkgdb_acquire_lock
-    trap '_pkgdb_release_lock' RETURN
+    local fd
+    fd=$(_pkgdb_acquire_lock 201)
+    # insert run
+    local sql
+    sql="INSERT INTO build_runs (run_uuid, started_at, user, host, chroot_path) VALUES('$run_uuid', DATETIME('now'), '$user', '$host', '$chroot_path'); SELECT last_insert_rowid();"
     local run_id
     run_id=$(sqlite3 "$PKGDB_PATH" "PRAGMA busy_timeout=$PKGDB_BUSY_TIMEOUT; $sql" | tail -n1)
+    _pkgdb_release_lock "$fd"
     echo "$run_id"
 }
 
-# Register package (idempotent)
+# Register package (idempotent) -> prints pkg_id
 pkgdb_register_package() {
     local name="$1"
     local version="${2:-}"
     local source_hash="${3:-}"
     local recipe_path="${4:-}"
-
-    local escaped_name
-    escaped_name=$(printf '%q' "$name")
-    local sql="BEGIN;
-INSERT OR IGNORE INTO packages (name, version, source_hash, recipe_path) VALUES('$name', '$version', '$source_hash', '$recipe_path');
-SELECT id FROM packages WHERE name='$name' AND version='$version';
+    local fd
+    fd=$(_pkgdb_acquire_lock 202)
+    local sql
+    # basic sanitization of single quotes
+    local sname sver shash srec
+    sname=$(printf "%s" "$name" | sed "s/'/''/g")
+    sver=$(printf "%s" "$version" | sed "s/'/''/g")
+    shash=$(printf "%s" "$source_hash" | sed "s/'/''/g")
+    srec=$(printf "%s" "$recipe_path" | sed "s/'/''/g")
+    sql="BEGIN;
+INSERT OR IGNORE INTO packages (name, version, source_hash, recipe_path) VALUES('$sname', '$sver', '$shash', '$srec');
+SELECT id FROM packages WHERE name='$sname' AND version='$sver';
 COMMIT;"
-    _pkgdb_acquire_lock
-    trap '_pkgdb_release_lock' RETURN
     local pkg_id
     pkg_id=$(sqlite3 "$PKGDB_PATH" "PRAGMA busy_timeout=$PKGDB_BUSY_TIMEOUT; $sql" | tail -n1)
+    _pkgdb_release_lock "$fd"
     echo "$pkg_id"
 }
 
-# Start a job, returns job_id
+# Start job -> prints job_id
 pkgdb_start_job() {
     local run_id="$1"
     local pkg_id="$2"
     local worker="${3:-}"
     local log_path="${4:-}"
-
     local started_at
     started_at=$(date '+%Y-%m-%d %H:%M:%S')
-    local sql="INSERT INTO build_jobs (run_id, pkg_id, started_at, worker, log_path) VALUES($run_id, $pkg_id, '$started_at', '$worker', '$log_path'); SELECT last_insert_rowid();"
-    _pkgdb_acquire_lock
-    trap '_pkgdb_release_lock' RETURN
+    local fd
+    fd=$(_pkgdb_acquire_lock 203)
+    local sql
+    sql="INSERT INTO build_jobs (run_id, pkg_id, started_at, worker, log_path) VALUES($run_id, $pkg_id, '$started_at', '$worker', '$log_path'); SELECT last_insert_rowid();"
     local job_id
     job_id=$(sqlite3 "$PKGDB_PATH" "PRAGMA busy_timeout=$PKGDB_BUSY_TIMEOUT; $sql" | tail -n1)
+    _pkgdb_release_lock "$fd"
     echo "$job_id"
 }
 
-# Start a step, returns step_id
+# Start step -> prints step_id
 pkgdb_start_step() {
     local job_id="$1"
     local step_name="$2"
     local step_order="${3:-0}"
     local started_at
     started_at=$(date '+%Y-%m-%d %H:%M:%S')
-    local sql="INSERT INTO job_steps (job_id, step_order, step_name, started_at, status) VALUES($job_id, $step_order, '$step_name', '$started_at', 'running'); SELECT last_insert_rowid();"
-    _pkgdb_acquire_lock
-    trap '_pkgdb_release_lock' RETURN
+    local fd
+    fd=$(_pkgdb_acquire_lock 204)
+    local sname
+    sname=$(printf "%s" "$step_name" | sed "s/'/''/g")
+    local sql
+    sql="INSERT INTO job_steps (job_id, step_order, step_name, started_at, status) VALUES($job_id, $step_order, '$sname', '$started_at', 'running'); SELECT last_insert_rowid();"
     local step_id
     step_id=$(sqlite3 "$PKGDB_PATH" "PRAGMA busy_timeout=$PKGDB_BUSY_TIMEOUT; $sql" | tail -n1)
+    _pkgdb_release_lock "$fd"
     echo "$step_id"
 }
 
-# Update a step (status, exit_code, snippets)
+# Update step (status, exit_code, stdout_snippet, stderr_snippet)
 pkgdb_update_step() {
     local step_id="$1"
     local status="${2:-}"
-    local exit_code="${3:-}"
+    local exit_code="${3:-0}"
     local stdout_snippet="${4:-}"
     local stderr_snippet="${5:-}"
     local finished_at
     finished_at=$(date '+%Y-%m-%d %H:%M:%S')
-
-    # sanitize snippets to single-quoted SQL literals (very basic, avoid injection)
-    stdout_snippet=$(printf '%s' "$stdout_snippet" | sed "s/'/''/g")
-    stderr_snippet=$(printf '%s' "$stderr_snippet" | sed "s/'/''/g")
-
-    local sql="UPDATE job_steps SET status='${status}', exit_code=${exit_code}, stdout_snippet='${stdout_snippet}', stderr_snippet='${stderr_snippet}', finished_at='${finished_at}' WHERE id=${step_id};"
-    _pkgdb_acquire_lock
-    trap '_pkgdb_release_lock' RETURN
+    stdout_snippet=$(printf "%s" "$stdout_snippet" | sed "s/'/''/g" | cut -c1-4000)
+    stderr_snippet=$(printf "%s" "$stderr_snippet" | sed "s/'/''/g" | cut -c1-4000)
+    local fd
+    fd=$(_pkgdb_acquire_lock 205)
+    local sql
+    sql="UPDATE job_steps SET status='${status}', exit_code=${exit_code}, stdout_snippet='${stdout_snippet}', stderr_snippet='${stderr_snippet}', finished_at='${finished_at}' WHERE id=${step_id};"
     sqlite3 "$PKGDB_PATH" "PRAGMA busy_timeout=$PKGDB_BUSY_TIMEOUT; $sql"
+    _pkgdb_release_lock "$fd"
 }
 
 # Finish job
@@ -360,10 +422,12 @@ pkgdb_finish_job() {
     local exit_code="${3:-0}"
     local finished_at
     finished_at=$(date '+%Y-%m-%d %H:%M:%S')
-    local sql="UPDATE build_jobs SET status='${status}', exit_code=${exit_code}, finished_at='${finished_at}' WHERE id=${job_id};"
-    _pkgdb_acquire_lock
-    trap '_pkgdb_release_lock' RETURN
+    local fd
+    fd=$(_pkgdb_acquire_lock 206)
+    local sql
+    sql="UPDATE build_jobs SET status='${status}', exit_code=${exit_code}, finished_at='${finished_at}' WHERE id=${job_id};"
     sqlite3 "$PKGDB_PATH" "PRAGMA busy_timeout=$PKGDB_BUSY_TIMEOUT; $sql"
+    _pkgdb_release_lock "$fd"
 }
 
 # Finish run
@@ -372,10 +436,12 @@ pkgdb_finish_run() {
     local status="${2:-success}"
     local finished_at
     finished_at=$(date '+%Y-%m-%d %H:%M:%S')
-    local sql="UPDATE build_runs SET status='${status}', finished_at='${finished_at}' WHERE id=${run_id};"
-    _pkgdb_acquire_lock
-    trap '_pkgdb_release_lock' RETURN
+    local fd
+    fd=$(_pkgdb_acquire_lock 207)
+    local sql
+    sql="UPDATE build_runs SET status='${status}', finished_at='${finished_at}' WHERE id=${run_id};"
     sqlite3 "$PKGDB_PATH" "PRAGMA busy_timeout=$PKGDB_BUSY_TIMEOUT; $sql"
+    _pkgdb_release_lock "$fd"
 }
 
 # Record event
@@ -384,40 +450,40 @@ pkgdb_record_event() {
     local job_id="${2:-NULL}"
     local level="${3:-INFO}"
     local message="${4:-}"
-    message=$(printf '%s' "$message" | sed "s/'/''/g")
+    message=$(printf "%s" "$message" | sed "s/'/''/g")
     local ts
     ts=$(date '+%Y-%m-%d %H:%M:%S')
-    local sql="INSERT INTO events (run_id, job_id, timestamp, level, message) VALUES(${run_id}, ${job_id}, '${ts}', '${level}', '${message}');"
-    _pkgdb_acquire_lock
-    trap '_pkgdb_release_lock' RETURN
+    local fd
+    fd=$(_pkgdb_acquire_lock 208)
+    local sql
+    sql="INSERT INTO events (run_id, job_id, timestamp, level, message) VALUES(${run_id}, ${job_id}, '${ts}', '${level}', '${message}');"
     sqlite3 "$PKGDB_PATH" "PRAGMA busy_timeout=$PKGDB_BUSY_TIMEOUT; $sql"
+    _pkgdb_release_lock "$fd"
 }
 
-# Sample resource usage and insert into resource_samples
+# Insert resource sample (called by sampler)
 pkgdb_sample_resource() {
     local job_id="$1"
     local sample_time
     sample_time=$(date '+%Y-%m-%d %H:%M:%S')
-    # CPU: compute deltas from /proc/stat between calls is complex; use top-level snapshot using awk
-    # We'll compute simple approximations: cpu usage via top-like calculation
-    # simplified: read /proc/stat first line
+
+    # Get CPU snapshot (basic single-sample approximation)
     local cpu_line
-    cpu_line=$(awk '/^cpu / {print $0}' /proc/stat 2>/dev/null || echo "")
-    # parse
-    read -r _ user nice system idle iowait irq softirq steal guest gguest <<<"$cpu_line" || true
-    local cpu_total=$((user + nice + system + idle + iowait + irq + softirq + steal))
-    # store user and system as percentage of total (approx; may be >100 on single-snapshot)
-    local cpu_user_pct=0
-    local cpu_system_pct=0
+    cpu_line=$(awk '/^cpu /{print $0}' /proc/stat 2>/dev/null || echo "")
+    read -r _ user nice system idle iowait irq softirq steal guest guest_n <<<"$cpu_line" || true
+    local cpu_total=0
+    cpu_total=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    local cpu_user_pct=0.0
+    local cpu_system_pct=0.0
     if [ "$cpu_total" -gt 0 ]; then
-        cpu_user_pct=$(awk "BEGIN{printf \"%.2f\", (${user} / ${cpu_total}) * 100}")
-        cpu_system_pct=$(awk "BEGIN{printf \"%.2f\", (${system} / ${cpu_total}) * 100}")
+        cpu_user_pct=$(awk "BEGIN{printf \"%.2f\", (${user}/${cpu_total})*100}")
+        cpu_system_pct=$(awk "BEGIN{printf \"%.2f\", (${system}/${cpu_total})*100}")
     fi
 
-    # mem
+    # Memory
     local mem_total_kb mem_avail_kb mem_used_kb
-    mem_total_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-    mem_avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+    mem_total_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo || echo 0)
+    mem_avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo || echo 0)
     if [ -n "$mem_total_kb" ] && [ -n "$mem_avail_kb" ]; then
         mem_used_kb=$((mem_total_kb - mem_avail_kb))
     else
@@ -425,129 +491,145 @@ pkgdb_sample_resource() {
         mem_total_kb=0
     fi
 
-    # disk stats for PKGDB_PATH fs
-    local fs
-    fs=$(df --block-size=1K --output=used,avail,target "$(dirname "$PKGDB_PATH")" 2>/dev/null | tail -n1 | awk '{print $1","$2","$3}')
-    local disk_used_kb=0
-    local disk_total_kb=0
-    if [ -n "$fs" ]; then
-        local used avail target
-        IFS=, read -r used avail target <<<"$fs"
-        # total = used + avail
-        disk_used_kb=$((used))
-        disk_total_kb=$((used + avail))
+    # Disk for PKGDB_PATH mount point
+    local dfline
+    dfline=$(df --block-size=1K --output=used,avail "$(dirname "$PKGDB_PATH")" 2>/dev/null | tail -n1 || true)
+    local used_kb=0 total_kb=0
+    if [ -n "$dfline" ]; then
+        used_kb=$(awk '{print $1}' <<<"$dfline" || echo 0)
+        local avail_kb
+        avail_kb=$(awk '{print $2}' <<<"$dfline" || echo 0)
+        total_kb=$((used_kb + (avail_kb)))
     fi
 
-    # load averages
+    # loadavg
     local load1 load5 load15
     read -r load1 load5 load15 _ < /proc/loadavg
 
-    # write to DB
-    local sql="INSERT INTO resource_samples (job_id, timestamp, cpu_user_pct, cpu_system_pct, mem_used_kb, mem_total_kb, disk_used_kb, disk_total_kb, load_1, load_5, load_15) VALUES($job_id, '${sample_time}', ${cpu_user_pct}, ${cpu_system_pct}, ${mem_used_kb}, ${mem_total_kb}, ${disk_used_kb}, ${disk_total_kb}, ${load1}, ${load5}, ${load15});"
-    # wrap lock around this small insert
-    _pkgdb_acquire_lock
-    trap '_pkgdb_release_lock' RETURN
+    # Insert
+    local fd
+    fd=$(_pkgdb_acquire_lock 209)
+    local sql
+    sql="INSERT INTO resource_samples (job_id, timestamp, cpu_user_pct, cpu_system_pct, mem_used_kb, mem_total_kb, disk_used_kb, disk_total_kb, load_1, load_5, load_15) VALUES($job_id, '$sample_time', $cpu_user_pct, $cpu_system_pct, $mem_used_kb, $mem_total_kb, $used_kb, $total_kb, $load1, $load5, $load15);"
     sqlite3 "$PKGDB_PATH" "PRAGMA busy_timeout=$PKGDB_BUSY_TIMEOUT; $sql" || true
+    _pkgdb_release_lock "$fd"
 }
 
-# Simple helpers for logging with colors
-_log_color() {
-    local color="$1"; shift
+# -------------------------
+# Logging / UI helpers
+# -------------------------
+# Color helper
+_color() {
+    case "$1" in
+        red) printf '\033[31m%s\033[0m' "$2";;
+        green) printf '\033[32m%s\033[0m' "$2";;
+        yellow) printf '\033[33m%s\033[0m' "$2";;
+        blue) printf '\033[34m%s\033[0m' "$2";;
+        bold) printf '\033[1m%s\033[0m' "$2";;
+        *) printf '%s' "$2";;
+    esac
+}
+
+_log() {
+    local level="$1"; shift
     local msg="$*"
     if [ "${QUIET,,}" = "yes" ]; then
-        # in quiet mode only print errors
-        if [ "$color" = "red" ]; then
-            printf '\e[31m%s\e[0m\n' "$msg" >&2
+        # quiet: only errors go to stderr
+        if [ "$level" = "ERROR" ]; then
+            printf '%s\n' "$( _color red "ERROR:" ) $msg" >&2
         fi
     else
-        case "$color" in
-            red)  printf '\e[31m%s\e[0m\n' "$msg" >&2 ;;
-            green) printf '\e[32m%s\e[0m\n' "$msg" ;;
-            yellow) printf '\e[33m%s\e[0m\n' "$msg" ;;
-            blue) printf '\e[34m%s\e[0m\n' "$msg" ;;
+        case "$level" in
+            INFO) printf '%s\n' "$( _color blue "INFO:" ) $msg" ;;
+            OK)   printf '%s\n' "$( _color green "OK:" ) $msg" ;;
+            WARN) printf '%s\n' "$( _color yellow "WARN:" ) $msg" ;;
+            ERROR) printf '%s\n' "$( _color red "ERROR:" ) $msg" >&2 ;;
             *) printf '%s\n' "$msg" ;;
         esac
     fi
 }
-log_info()  { _log_color blue "$@"; }
-log_ok()    { _log_color green "$@"; }
-log_warn()  { _log_color yellow "$@"; }
-log_err()   { _log_color red "$@"; }
 
-# UI: footer drawing (simple implementation)
-_pkgdb_footer_clear() {
-    tput sc
-    tput cuu1
-    tput el
-    tput rc
-}
+log_info()  { _log INFO "$*"; }
+log_ok()    { _log OK "$*"; }
+log_warn()  { _log WARN "$*"; }
+log_err()   { _log ERROR "$*"; }
 
+# Progress/footer drawer (simple, single-line)
 _pkgdb_draw_footer() {
-    # Accepts: global_pct current_job current_step elapsed_time cpu mem load1
-    local global_pct="${1:-0}"
-    local jobname="${2:-idle}"
+    local percent="${1:-0}"
+    local job="${2:-idle}"
     local step="${3:-}"
     local elapsed="${4:-0s}"
     local cpu="${5:-0.0}"
     local mem="${6:-0/0}"
     local load1="${7:-0.00}"
 
-    # build bar (width adaptive)
-    local width
-    width=$(tput cols 2>/dev/null || echo 80)
-    local bar_width=$((width - 45))
-    if [ "$bar_width" -lt 10 ]; then bar_width=10; fi
-    local filled=$(( (global_pct * bar_width) / 100 ))
+    local cols
+    cols=$(tput cols 2>/dev/null || echo 80)
+    local bar_w=$((cols - 60))
+    [ "$bar_w" -lt 10 ] && bar_w=10
+    local filled=$(( (percent * bar_w) / 100 ))
     local bar=""
-    local i
-    for ((i=0;i<filled;i++)); do bar="${bar}#"; done
-    for ((i=filled;i<bar_width;i++)); do bar="${bar}-"; done
-    # render
-    printf '\r[%3s%%] %s | %s | CPU:%5s%% MEM:%s LOAD:%s' "$global_pct" "$bar" "$jobname:$step" "$cpu" "$mem" "$load1"
+    printf -v bar "%*s" "$filled" ""
+    bar=${bar// /#}
+    local rest=""
+    printf -v rest "%*s" "$((bar_w - filled))" ""
+    rest=${rest// /-}
+    printf '\r[%3s%%] %s%s | %s | CPU:%5s%% MEM:%s LOAD:%s' "$percent" "$bar" "$rest" "$job:$step" "$cpu" "$mem" "$load1"
 }
 
-# Sampler control (background process)
-PKGDB_SAMPLER_PID_FILE="/tmp/pkgdb_sampler.pid"
+# Sampler background PID file (per job)
+PKGDB_SAMPLER_PIDFILE="/tmp/pkgdb_sampler.pid"
+
 pkgdb_sampler_start() {
     local job_id="$1"
     local interval="${2:-$PKGDB_SAMPLE_INTERVAL}"
-    if [ -z "$job_id" ]; then
-        return 1
-    fi
-    # ensure only one sampler per job on same host (simple approach)
-    if [ -f "$PKGDB_SAMPLER_PID_FILE" ]; then
-        local oldpid
-        oldpid=$(cat "$PKGDB_SAMPLER_PID_FILE" 2>/dev/null || echo "")
-        if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
-            return 0
-        fi
-    fi
-
+    if [ -z "$job_id" ]; then return 1; fi
+    # start background sampler
     (
-        # background loop
         while :; do
             pkgdb_sample_resource "$job_id" || true
             sleep "$interval"
         done
     ) &
-    echo $! > "$PKGDB_SAMPLER_PID_FILE"
+    echo $! > "$PKGDB_SAMPLER_PIDFILE"
 }
 
 pkgdb_sampler_stop() {
-    if [ -f "$PKGDB_SAMPLER_PID_FILE" ]; then
+    if [ -f "$PKGDB_SAMPLER_PIDFILE" ]; then
         local pid
-        pid=$(cat "$PKGDB_SAMPLER_PID_FILE" 2>/dev/null || echo "")
+        pid=$(cat "$PKGDB_SAMPLER_PIDFILE" 2>/dev/null || echo "")
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
-            sleep 0.1
+            sleep 0.05
             kill -9 "$pid" 2>/dev/null || true
         fi
-        rm -f "$PKGDB_SAMPLER_PID_FILE" 2>/dev/null || true
+        rm -f "$PKGDB_SAMPLER_PIDFILE" 2>/dev/null || true
     fi
 }
 
-# Query helpers (basic)
-pkgdb_get_run_summary() {
+# Prepare log path for job
+pkgdb_prepare_job_logpath() {
+    local name="$1"
+    local version="$2"
+    local run_uuid="$3"
+    local fname
+    fname=$(printf '%s-%s-%s.log' "$name" "$version" "$run_uuid" | sed 's/[^a-zA-Z0-9._-]/_/g')
+    _mkdirp "$PKGDB_LOG_DIR"
+    echo "$PKGDB_LOG_DIR/$fname"
+}
+
+# -------------------------
+# Maintenance & Reports
+# -------------------------
+pkgdb_vacuum() {
+    local fd
+    fd=$(_pkgdb_acquire_lock 210)
+    sqlite3 "$PKGDB_PATH" "VACUUM;"
+    _pkgdb_release_lock "$fd"
+}
+
+pkgdb_report_run() {
     local run_id="$1"
     sqlite3 -json "$PKGDB_PATH" "SELECT * FROM build_runs WHERE id=$run_id;"
 }
@@ -556,46 +638,19 @@ pkgdb_list_running_jobs() {
     sqlite3 -json "$PKGDB_PATH" "SELECT * FROM build_jobs WHERE status='running';"
 }
 
-# Maintenance
-pkgdb_vacuum() {
-    _pkgdb_acquire_lock
-    trap '_pkgdb_release_lock' RETURN
-    sqlite3 "$PKGDB_PATH" "VACUUM;"
+# Cleanup function to be used by orchestrator traps
+pkgdb_cleanup() {
+    pkgdb_sampler_stop || true
+    # nothing else forced here; locks are released by functions
 }
 
-# Report: simple run summary print
-pkgdb_report_run() {
-    local run_id="$1"
-    echo "Run summary for run id: $run_id"
-    sqlite3 "$PKGDB_PATH" "SELECT id, run_uuid, started_at, finished_at, status FROM build_runs WHERE id=$run_id;"
-    echo "Jobs:"
-    sqlite3 "$PKGDB_PATH" "SELECT bj.id, p.name, p.version, bj.status, bj.started_at, bj.finished_at, bj.log_path FROM build_jobs bj JOIN packages p ON bj.pkg_id = p.id WHERE bj.run_id=$run_id;"
-}
-
-# Ensure logfile path for a job
-pkgdb_prepare_job_logpath() {
-    local name="$1"
-    local version="$2"
-    local run_uuid="$3"
-    local filename
-    filename="$(printf '%s-%s-%s.log' "$name" "$version" "$run_uuid" | sed 's/[^a-zA-Z0-9._-]/_/g')"
-    _mkdirp "$PKGDB_LOG_DIR"
-    echo "$PKGDB_LOG_DIR/$filename"
-}
-
-# Safe shutdown trap - to be called by orchestrator setup
-pkgdb_setup_traps() {
-    trap 'pkgdb_sampler_stop; exit 1' INT TERM
-    trap 'pkgdb_sampler_stop; exit 0' EXIT
-}
-
-# Expose minimal exported API list (for introspection)
+# Exported API list (for help)
 pkgdb_api_list() {
     cat <<'API'
-Exported functions:
-- pkgdb_load_config <config_path>
-- pkgdb_init_db
-- pkgdb_backup
+pkg-db module functions (to be sourced):
+- pkgdb_load_config [path]
+- pkgdb_init_env
+- pkgdb_init_db_schema
 - pkgdb_init_run [run_uuid] [user] [host] [chroot_path] -> prints run_id
 - pkgdb_register_package <name> <version> <source_hash> <recipe_path> -> prints pkg_id
 - pkgdb_start_job <run_id> <pkg_id> <worker> <log_path> -> prints job_id
@@ -607,16 +662,21 @@ Exported functions:
 - pkgdb_sample_resource <job_id>
 - pkgdb_sampler_start <job_id> [interval]
 - pkgdb_sampler_stop
-- pkgdb_get_run_summary <run_id>
-- pkgdb_report_run <run_id>
+- pkgdb_prepare_job_logpath <name> <version> <run_uuid> -> prints path
+- pkgdb_backup
+- pkgdb_integrity_check
 - pkgdb_vacuum
+- pkgdb_report_run <run_id>
+- pkgdb_list_running_jobs
 API
 }
 
-# If script run directly (not sourced) - show usage/help
+# If executed directly, print help
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-    echo "This script is a module. It's intended to be sourced by the orquestrator."
+    echo "pkg-db.sh is a module, intended to be sourced by the orchestrator."
     echo
     pkgdb_api_list
     exit 0
 fi
+
+# End of module
