@@ -1,0 +1,75 @@
+ROADMAP - SHELL SCRIPT PARA LINUX FROM SCRATCH E BEYOND LINUX FROM SCRATCH
+
+Objetivo: Criar um conjunto modular de scripts em shell que construa e mantenha atualizada uma distribuição Linux From Scratch (LFS) e Beyond Linux From Scratch (BLFS) completa, com segurança, reprodutibilidade e isolamento total via chroot seguro.
+
+O sistema será completamente modular. Cada função (download, verificação, build, instalação, atualização, limpeza) será implementada como um módulo independente com seu próprio arquivo de configuração. Todo o processo ocorrerá dentro de um chroot seguro com montagem e desmontagem automáticas e protegidas. O sistema suportará reconstruções e atualizações automáticas de forma segura e reprodutível, utilizando apenas shell script e ferramentas padrão do Linux.
+
+Estrutura de diretórios proposta:
+/usr/local/bin/lfs-builder/
+lfs-builder.sh (script principal orquestrador)
+modules/
+00-prepare-env.sh
+chroot-manager.sh
+10-downloader.sh
+11-verifier.sh
+20-build-package.sh
+30-install-package.sh
+40-post-install.sh
+50-cleanup.sh
+pkg-db.sh
+update-manager.sh
+conf/
+global.conf
+modules/
+prepare-env.conf
+chroot-manager.conf
+downloader.conf
+verifier.conf
+build-package.conf
+install-package.conf
+post-install.conf
+cleanup.conf
+pkg-db.conf
+update-manager.conf
+recipes/
+glibc.recipe
+linux.recipe
+outros recipes de pacotes
+
+Descrição dos módulos:
+00-prepare-env: prepara diretórios, valida pré-requisitos e cria usuário de build.
+chroot-manager: cria e gerencia o ambiente chroot com montagens seguras, isolamento por namespace e desmontagem automática.
+10-downloader: baixa fontes listadas nos recipes, suporta múltiplos mirrors e verificação básica.
+11-verifier: valida assinaturas GPG e checksums das fontes.
+20-build-package: compila pacotes conforme recipes, registrando logs e metadados no banco local.
+30-install-package: instala pacotes dentro do chroot de forma transacional e gera manifestos de instalação.
+40-post-install: executa configurações pós-instalação, ajustes de sistema e testes básicos.
+50-cleanup: desmonta o ambiente chroot, remove temporários e cria snapshots se configurado.
+pkg-db: mantém um banco simples de pacotes instalados, versões, hashes e logs.
+update-manager: verifica versões novas, planeja rebuilds e aplica atualizações automáticas ou manuais.
+lfs-builder.sh: interface de linha de comando que orquestra os módulos e fornece comandos como build, update, status e clean.
+
+Fluxo de execução geral:
+1. Preparar o ambiente de build.
+2. Criar o chroot seguro com montagem e namespaces.
+3. Baixar e verificar fontes.
+4. Compilar pacotes conforme recipes.
+5. Instalar e registrar pacotes.
+6. Executar pós-instalação e testes básicos.
+7. Limpar e desmontar o ambiente.
+8. Realizar atualizações futuras de forma incremental.
+
+Segurança:
+Uso de namespaces (quando possível), montagem com flags seguras, validação de assinaturas GPG, desmontagem segura com traps e rollback em falhas.
+
+Atualizações:
+Controle de versões e dependências via recipes, reconstrução automática apenas dos pacotes afetados, snapshots opcionais e logs detalhados de cada etapa.
+
+Logs e relatórios:
+Cada build gera logs em build/logs/<pacote>.log e relatórios JSON simples contendo nome, versão, tempo e resultado.
+
+CLI:
+Comandos: lfs-builder init, lfs-builder build all, lfs-builder build <pacote>, lfs-builder update check, lfs-builder update apply, lfs-builder status, lfs-builder clean.
+Flags: --dry-run, --verbose, --force, --jobs N.
+
+Fim do roadmap.
