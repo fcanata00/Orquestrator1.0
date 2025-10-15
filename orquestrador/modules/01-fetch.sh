@@ -17,17 +17,12 @@ SOURCES_DIR="${SOURCES_DIR:-$LFS_BUILDER_ROOT/sources}"
 METAFILES_DIR="${METAFILES_DIR:-$LFS_BUILDER_ROOT/metafiles}"
 FETCH_STATE_FILE="${FETCH_STATE_FILE:-$STATEDIR/fetch.yml}"
 CONFIG_FILE="${CONFIG_FILE:-$LFS_BUILDER_ROOT/config.env}"
-# Logfile por execução (sufixo definido na main)
-LOGFILE="${LOGFILE:-$LOGDIR/fetch-$(date +'%F_%H-%M-%S').log}"
 CONCURRENCY="${CONCURRENCY:-$(nproc)}"
 VERBOSITY="${VERBOSITY:-1}"
-PKG_METAFILES_DIR="${METAFILES_DIR:-$LFS_BUILDER_ROOT/metafiles}"
-PER_PKG_STATE_DIR="${STATEDIR}/fetch.d"
-GLOBAL_FETCH_STATE="${FETCH_STATE_FILE:-$STATEDIR/fetch.yml}"
 # ---------------------------
 # Inicialização mínima de diretórios
 # ---------------------------
-mkdir -p "$LOGDIR" "$STATEDIR" "$LOCKDIR" "$SOURCES_DIR" "$METAFILES_DIR" "$PER_PKG_STATE_DIR"
+mkdir -p "$LOGDIR" "$STATEDIR" "$LOCKDIR" "$SOURCES_DIR" "$METAFILES_DIR"
 # ---------------------------
 # Cores
 # ---------------------------
